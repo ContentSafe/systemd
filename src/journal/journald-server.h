@@ -35,6 +35,8 @@
 #include "journald-rate-limit.h"
 #include "list.h"
 
+#include "socket-util.h"
+
 typedef enum Storage {
         STORAGE_AUTO,
         STORAGE_VOLATILE,
@@ -56,6 +58,7 @@ typedef struct StdoutStream StdoutStream;
 
 typedef struct Server {
         int syslog_fd;
+        int remote_syslog_fd;
         int native_fd;
         int stdout_fd;
         int dev_kmsg_fd;
@@ -98,9 +101,11 @@ typedef struct Server {
 
         bool forward_to_kmsg;
         bool forward_to_syslog;
+        bool forward_to_remote_syslog;
         bool forward_to_console;
         bool forward_to_wall;
 
+        union sockaddr_union remote_syslog_dest;
         unsigned n_forward_syslog_missed;
         usec_t last_warn_forward_syslog_missed;
 
@@ -157,6 +162,14 @@ void server_driver_message(Server *s, sd_id128_t message_id, const char *format,
 const struct ConfigPerfItem* journald_gperf_lookup(const char *key, unsigned length);
 
 int config_parse_storage(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
+
+int config_parse_remotesyslogtarget(const char *unit,
+                const char *filename, unsigned line,
+                const char *section, unsigned section_line,
+                const char *lvalue, int ltype,
+                const char *rvalue,
+                void *data, void *userdata);
+
 
 const char *storage_to_string(Storage s) _const_;
 Storage storage_from_string(const char *s) _pure_;

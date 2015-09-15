@@ -23,6 +23,29 @@
 
 #include "journald-server.h"
 
+typedef struct SyslogMessage {
+/* obey rfc5424:
+ *       SYSLOG-MSG      = HEADER SP STRUCTURED-DATA [SP MSG]
+ *
+ *       HEADER          = PRI VERSION SP TIMESTAMP SP HOSTNAME
+ *                         SP APP-NAME SP PROCID SP MSGID
+ * [...]
+ */
+        int priority;
+        struct tm timestamp;
+        const char *hostname;
+        const char *appname;
+        pid_t procid;
+        const char *msgid;
+        /* we don't do STRUCTURED-DATA */
+        const char *message;
+
+        char _priver[8];
+        char _procid[16];
+        char _timestamp[64];
+
+} SyslogMessage;
+
 int syslog_fixup_facility(int priority) _const_;
 
 size_t syslog_parse_identifier(const char **buf, char **identifier, char **pid);

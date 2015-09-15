@@ -30,6 +30,8 @@ Journal.RuntimeKeepFree,    config_parse_iec_off,    0, offsetof(Server, runtime
 Journal.MaxRetentionSec,    config_parse_sec,        0, offsetof(Server, max_retention_usec)
 Journal.MaxFileSec,         config_parse_sec,        0, offsetof(Server, max_file_usec)
 Journal.ForwardToSyslog,    config_parse_bool,       0, offsetof(Server, forward_to_syslog)
+Journal.ForwardToRemoteSyslog, config_parse_bool,    0, offsetof(Server, forward_to_remote_syslog)
+Journal.RemoteSyslogTarget, config_parse_remotesyslogtarget, 0, 0
 Journal.ForwardToKMsg,      config_parse_bool,       0, offsetof(Server, forward_to_kmsg)
 Journal.ForwardToConsole,   config_parse_bool,       0, offsetof(Server, forward_to_console)
 Journal.ForwardToWall,      config_parse_bool,       0, offsetof(Server, forward_to_wall)

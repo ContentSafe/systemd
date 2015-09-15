@@ -22,6 +22,9 @@
 #include <unistd.h>
 #include <stddef.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "systemd/sd-messages.h"
 #include "socket-util.h"
@@ -109,6 +112,53 @@ static void forward_syslog_iovec(Server *s, const struct iovec *iovec, unsigned 
                 log_debug_errno(errno, "Failed to forward syslog message: %m");
 }
 
+static int maybe_open_remote_syslog(Server *s) {
+        int fd;
+
+        assert(s);
+
+        if (s->remote_syslog_fd > 0) return s->remote_syslog_fd;
+
+        if (s->remote_syslog_dest.in.sin_addr.s_addr == INADDR_NONE) {
+                return 0;
+        } else {
+                log_warning("remote syslog forwarding target configured: %s",
+                                inet_ntoa(s->remote_syslog_dest.in.sin_addr));
+        }
+        if (s->remote_syslog_dest.in.sin_family != AF_INET) { // set in config
+                log_warning("non AF_INET target for remote syslog forwarding configured. ignoring.");
+                return 0;
+        }
+
+        fd = socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+        if (fd < 0) {
+                log_error("socket() failed for remote syslog forwarding: %m");
+                return 0;
+        } else {
+                s->remote_syslog_fd = fd;
+        }
+
+        return s->remote_syslog_fd;
+}
+
+static void forward_remote_syslog_iovec(Server *s, const struct iovec *iovec, unsigned n_iovec) {
+        int fd;
+        assert(s);
+        assert(iovec);
+
+        fd = maybe_open_remote_syslog(s);
+        if (!fd) return;
+        struct msghdr msghdr = {
+                .msg_iov = (struct iovec *) iovec,
+                .msg_iovlen = n_iovec,
+                .msg_name = (struct sockaddr*) &s->remote_syslog_dest,
+                .msg_namelen = sizeof(s->remote_syslog_dest),
+        };
+        sendmsg(fd, &msghdr, MSG_NOSIGNAL);
+        // this might fail and indeed, we do ignore it
+        // (logging shall not wait for network to become available)
+}
+
 static void forward_syslog_raw(Server *s, int priority, const char *buffer, const struct ucred *ucred, const struct timeval *tv) {
         struct iovec iovec;
 
@@ -122,14 +172,72 @@ static void forward_syslog_raw(Server *s, int priority, const char *buffer, cons
         forward_syslog_iovec(s, &iovec, 1, ucred, tv);
 }
 
+static int syslog_fill_iovec(SyslogMessage *sm, struct iovec *iovec, unsigned *n_iovec) {
+        enum rfc5424 {PRIVER=0, TIMESTAMP, HOSTNAME, SP_HOSTNAME, APPNAME, SP_APPNAME, PROCID, MSGID, STRUDATA, MSG};
+        int offset;
+
+        if (*n_iovec < MSG+1) return -1;
+        assert(sm);
+        /* valid rfc5424 range of prioriy is 0..191
+         * (3 bit severity from 0 to 7;
+         *  5 bit facility from 0 to 23)
+         */
+        if (sm->priority>>3>23)
+                sm->priority = (sm->priority&7) + (23<<3); /* limit facility to 0..23 */
+
+        /* priority and version */
+        zero(sm->_priver);
+        sprintf(sm->_priver, "<%i>1 ", sm->priority);
+        IOVEC_SET_STRING(iovec[PRIVER], sm->_priver);
+
+        /* timestamp */
+        if (strftime(sm->_timestamp, sizeof(sm->_timestamp), "%Y-%m-%dT%H:%M:%S%z ", &sm->timestamp) <= 0) {
+                IOVEC_SET_STRING(iovec[TIMESTAMP], "- ");
+        } else {
+                IOVEC_SET_STRING(iovec[TIMESTAMP], sm->_timestamp);
+        }
+
+        offset = 0;
+        if (strncmp("_HOSTNAME=", sm->hostname, 10) == 0) offset = 10;
+        IOVEC_SET_STRING(iovec[HOSTNAME], sm->hostname+offset);
+        IOVEC_SET_STRING(iovec[SP_HOSTNAME], " ");
+        IOVEC_SET_STRING(iovec[APPNAME], sm->appname);
+        IOVEC_SET_STRING(iovec[SP_APPNAME], " ");
+
+        if (sm->procid) {
+                snprintf(sm->_procid, sizeof(sm->_procid), "["PID_FMT"]: ", sm->procid);
+                char_array_0(sm->_procid);
+        } else {
+                sprintf(sm->_procid, "- ");
+        }
+        IOVEC_SET_STRING(iovec[PROCID], sm->_procid);
+
+        IOVEC_SET_STRING(iovec[MSGID], sm->msgid);
+        IOVEC_SET_STRING(iovec[STRUDATA], " - ");
+
+        IOVEC_SET_STRING(iovec[MSG], sm->message);
+        *n_iovec = MSG+1;
+        return *n_iovec;
+}
+
+static void syslog_init_message(SyslogMessage *sm) {
+        /* some parts of a rfc5424 syslog message may
+         * be carry a "-" if respective data is n/a.
+         */
+        sm->priority = 14;
+        sm->procid = 0;
+        sm->hostname =
+        sm->appname =
+        sm->msgid =
+        sm->message = "-";
+}
+
 void server_forward_syslog(Server *s, int priority, const char *identifier, const char *message, const struct ucred *ucred, const struct timeval *tv) {
-        struct iovec iovec[5];
-        char header_priority[DECIMAL_STR_MAX(priority) + 3], header_time[64],
-             header_pid[sizeof("[]: ")-1 + DECIMAL_STR_MAX(pid_t) + 1];
+        struct iovec iovec[10];
         int n = 0;
         time_t t;
-        struct tm *tm;
         char *ident_buf = NULL;
+        SyslogMessage sm;
 
         assert(s);
         assert(priority >= 0);
@@ -139,41 +247,41 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
         if (LOG_PRI(priority) > s->max_level_syslog)
                 return;
 
-        /* First: priority field */
-        xsprintf(header_priority, "<%i>", priority);
-        IOVEC_SET_STRING(iovec[n++], header_priority);
+        syslog_init_message(&sm);
+
+        /* First: priority field and VERSION */
+        sm.priority = priority;
 
         /* Second: timestamp */
         t = tv ? tv->tv_sec : ((time_t) (now(CLOCK_REALTIME) / USEC_PER_SEC));
-        tm = localtime(&t);
-        if (!tm)
+        if (!localtime_r(&t, &sm.timestamp))
                 return;
-        if (strftime(header_time, sizeof(header_time), "%h %e %T ", tm) <= 0)
-                return;
-        IOVEC_SET_STRING(iovec[n++], header_time);
+        if (!isempty(s->hostname_field))
+                sm.hostname = s->hostname_field;
 
-        /* Third: identifier and PID */
         if (ucred) {
                 if (!identifier) {
                         get_process_comm(ucred->pid, &ident_buf);
                         identifier = ident_buf;
                 }
 
-                xsprintf(header_pid, "["PID_FMT"]: ", ucred->pid);
-
-                if (identifier)
-                        IOVEC_SET_STRING(iovec[n++], identifier);
-
-                IOVEC_SET_STRING(iovec[n++], header_pid);
-        } else if (identifier) {
-                IOVEC_SET_STRING(iovec[n++], identifier);
-                IOVEC_SET_STRING(iovec[n++], ": ");
+                sm.procid = ucred->pid;
         }
 
-        /* Fourth: message */
-        IOVEC_SET_STRING(iovec[n++], message);
+        if (identifier) sm.appname = identifier;
 
-        forward_syslog_iovec(s, iovec, n, ucred, tv);
+        sm.message = message;
+
+        /* fill iovec from SyslogMessage struct */
+        n = sizeof(iovec)/sizeof(struct iovec);
+        if (syslog_fill_iovec(&sm, (struct iovec*)iovec, &n) <= 0)
+                return;
+
+        if (s->forward_to_syslog)
+                forward_syslog_iovec(s, iovec, n, ucred, tv);
+
+        if (s->forward_to_remote_syslog)
+                forward_remote_syslog_iovec(s, iovec, n);
 
         free(ident_buf);
 }
@@ -322,16 +430,18 @@ void server_process_syslog_message(
         unsigned n = 0;
         int priority = LOG_USER | LOG_INFO;
         _cleanup_free_ char *identifier = NULL, *pid = NULL;
-        const char *orig;
+        time_t t;
+        SyslogMessage sm;
 
         assert(s);
         assert(buf);
 
-        orig = buf;
-        syslog_parse_priority(&buf, &priority, true);
+        syslog_init_message(&sm);
 
-        if (s->forward_to_syslog)
-                forward_syslog_raw(s, priority, orig, ucred, tv);
+        if (!isempty(s->hostname_field))
+                sm.hostname = s->hostname_field;
+
+        syslog_parse_priority(&buf, &priority, true);
 
         syslog_skip_date((char**) &buf);
         syslog_parse_identifier(&buf, &identifier, &pid);
@@ -349,6 +459,7 @@ void server_process_syslog_message(
 
         sprintf(syslog_priority, "PRIORITY=%i", priority & LOG_PRIMASK);
         IOVEC_SET_STRING(iovec[n++], syslog_priority);
+        sm.priority = priority;
 
         if (priority & LOG_FACMASK) {
                 sprintf(syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority));
@@ -359,19 +470,45 @@ void server_process_syslog_message(
                 syslog_identifier = strjoina("SYSLOG_IDENTIFIER=", identifier);
                 if (syslog_identifier)
                         IOVEC_SET_STRING(iovec[n++], syslog_identifier);
+                sm.appname = identifier;
         }
 
         if (pid) {
                 syslog_pid = strjoina("SYSLOG_PID=", pid);
                 if (syslog_pid)
                         IOVEC_SET_STRING(iovec[n++], syslog_pid);
+                if (parse_pid(pid, &sm.procid))
+                        sm.procid = 0;
         }
 
         message = strjoina("MESSAGE=", buf);
-        if (message)
+        if (message) {
                 IOVEC_SET_STRING(iovec[n++], message);
+                sm.message = buf;
+        }
 
         server_dispatch_message(s, iovec, n, ELEMENTSOF(iovec), ucred, tv, label, label_len, NULL, priority, 0);
+
+        /* timestamp for SyslogMessage struct: */
+        t = tv ? tv->tv_sec : ((time_t) (now(CLOCK_REALTIME) / USEC_PER_SEC));
+        if (!localtime_r(&t, &sm.timestamp))
+                return;
+
+        /* fill iovec from SyslogMessage struct */
+        n = sizeof(iovec)/sizeof(struct iovec);
+        if (syslog_fill_iovec(&sm, (struct iovec*)iovec, &n) <= 0)
+                return;
+
+        if (s->forward_to_syslog)
+                forward_syslog_iovec(s, iovec, n, ucred, tv);
+                /* TODO: decision between raw and rewritten rfc5424
+                 * should be configurable
+                 * forward_syslog_raw(s, priority, orig, ucred, tv);
+                 */
+
+        if (s->forward_to_remote_syslog)
+                forward_remote_syslog_iovec(s, iovec, n);
+
 }
 
 int server_open_syslog_socket(Server *s) {

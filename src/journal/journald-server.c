@@ -52,6 +52,7 @@
 #include "journald-native.h"
 #include "journald-audit.h"
 #include "journald-server.h"
+#include "in-addr-util.h"
 #include "acl-util.h"
 
 #ifdef HAVE_SELINUX
@@ -1320,6 +1321,12 @@ static int server_parse_proc_cmdline(Server *s) {
                                 log_warning("Failed to parse forward to syslog switch %s. Ignoring.", word + 35);
                         else
                                 s->forward_to_syslog = r;
+                } else if (startswith(word, "systemd.journald.forward_to_remote_syslog=")) {
+                        r = parse_boolean(word + 42);
+                        if (r < 0)
+                                log_warning("Failed to parse forward to remote syslog switch %s. Ignoring.", word + 42);
+                        else
+                                s->forward_to_remote_syslog = r;
                 } else if (startswith(word, "systemd.journald.forward_to_kmsg=")) {
                         r = parse_boolean(word + 33);
                         if (r < 0)
@@ -1362,6 +1369,58 @@ static int server_dispatch_sync(sd_event_source *es, usec_t t, void *userdata) {
         assert(s);
 
         server_sync(s);
+        return 0;
+}
+
+int config_parse_remotesyslogtarget(const char *unit,
+                const char *filename, unsigned line,
+                const char *section, unsigned section_line,
+                const char *lvalue, int ltype,
+                const char *rvalue,
+                void *data, void *userdata) {
+
+        int r;
+        int family;
+        char *sep;
+        int port = 514;
+        union in_addr_union buffer;
+
+        Server *s = userdata;
+        assert(s);
+
+        assert(filename);
+        assert(section);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        sep = strchr(rvalue, ':');
+        if (sep && sep[1]) { // \0 termination of rvalue assumed
+            char *endptr = (char*)"invalid"; // anything != NULL for strtoul
+            port = strtoul(sep+1, &endptr, 10);
+            if ((endptr && *endptr) || (port <= 0 || port > UINT16_MAX)) {
+                log_syntax(unit, LOG_ERR, filename, line, EINVAL,
+                        "RemoteSyslogTarget (port) is invalid. Ignoring port specification.");
+                port = 514;
+            }
+            *sep='\0';
+        }
+
+        r = in_addr_from_string_auto(rvalue, &family, &buffer);
+        if (r < 0) {
+            log_syntax(unit, LOG_ERR, filename, line, EINVAL,
+                    "RemoteSyslogTarget is invalid, ignoring assignment: %s", rvalue);
+            return 0;
+        }
+        if (family != AF_INET) {
+            log_syntax(unit, LOG_ERR, filename, line, EINVAL,
+                    "RemoteSyslogTarget is non-AF_INET, ignoring assignment: %s", rvalue);
+            // sorry for not taking care of AF_INET6 right now
+            return 0;
+        }
+        s->remote_syslog_dest.in.sin_family = family;
+        s->remote_syslog_dest.in.sin_addr = buffer.in;
+        s->remote_syslog_dest.in.sin_port = htons(port);
         return 0;
 }
 
@@ -1461,7 +1520,10 @@ int server_init(Server *s) {
         assert(s);
 
         zero(*s);
-        s->syslog_fd = s->native_fd = s->stdout_fd = s->dev_kmsg_fd = s->audit_fd = s->hostname_fd = -1;
+        s->syslog_fd = s->native_fd = s->stdout_fd = s->dev_kmsg_fd = s->hostname_fd = -1;
+        s->syslog_fd = s->remote_syslog_fd = s->native_fd = s->stdout_fd = s->dev_kmsg_fd = s->audit_fd = s->hostname_fd = -1;
+        s->remote_syslog_dest.in.sin_addr.s_addr = INADDR_NONE;
+
         s->compress = true;
         s->seal = true;
 

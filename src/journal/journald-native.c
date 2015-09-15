@@ -270,7 +270,7 @@ void server_process_native_message(
         }
 
         if (message) {
-                if (s->forward_to_syslog)
+                if (s->forward_to_syslog || s->forward_to_remote_syslog)
                         server_forward_syslog(s, priority, identifier, message, ucred, tv);
 
                 if (s->forward_to_kmsg)
